@@ -1,0 +1,201 @@
+#! /usr/bin/env bash
+# 2016, Paul PLUTEX <info@plutex.de>.
+# All rights reserved.
+
+# Redistribution and use in source and binary forms, with or without modification, are
+# permitted provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice, this list of
+#   conditions and the following disclaimer.
+#
+# * Redistributions in binary form must reproduce the above copyright notice, this list
+#   of conditions and the following disclaimer in the documentation and/or other materials
+#   provided with the distribution.
+#
+# * The names of its contributors may not be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# * Feel free to send Club Mate to support the work.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS
+# OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS
+# AND CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Set PATH to save default
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Initialize variables
+ICINGA_URL=''
+ICINGA_USERNAME=''
+ICINGA_PASSWORD=''
+
+# Default states
+declare -i STATE_OK=0
+declare -i STATE_WARNING=1
+declare -i STATE_CRITICAL=2
+declare -i STATE_UNKNOWN=3
+
+# Initialize status variable
+declare -i ERR_CODE=$STATE_OK
+
+# Initialize error variable
+ERR_MSG=''
+
+# Include configuration file
+if [ -e /etc/nagios/check_icinga_status.cfg ]; then
+  . /etc/nagios/check_icinga_status.cfg
+elif [ -e "${HOME}/.config/etc/check_icinga_status.cfg" ]; then
+  . ${HOME}/.config/etc/check_icinga_status.cfg
+else
+  echo "Neiter ${HOME}/.config/etc/check_icinga_status.cfg or /etc/nagios/check_icinga_status.cfg found! Create one of it!" >&2
+  exit 1
+fi
+
+# Create temporary folder
+TMP_DIR="$(mktemp -d)"
+
+# Create netrc file
+cat >"${TMP_DIR}/netrc" <<EOF
+machine $(cut -d/ -f3 <<<"$ICINGA_URL") login ${ICINGA_USERNAME} password ${ICINGA_PASSWORD}
+EOF
+
+# Get Icinga status
+ICINGA_STATUS_HOSTS="$(curl --silent --netrc-file "${TMP_DIR}/netrc" "${ICINGA_URL}?style=hostdetail&hoststatustypes=12&jsonoutput" | jq .status.host_status)"
+ICINGA_STATUS_SERVICES="$(curl --silent --netrc-file "${TMP_DIR}/netrc" "${ICINGA_URL}?servicestatustypes=28&jsonoutput" | jq .status.service_status)"
+
+# If host problems are set
+if [ "$ICINGA_STATUS_HOSTS" != '[]' ]; then
+  # Count array elements
+  PROBLEM_HOSTS_COUNT="$(($(grep 'host_name' <<< "$ICINGA_STATUS_HOSTS" | wc -l)-1))"
+
+  # Iterate over elements
+  for i in $(seq 0 $PROBLEM_HOSTS_COUNT); do
+    # Get host items
+    HOST_NAME="$(jq ".[$i].host_name" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_STATUS="$(jq ".[$i].status" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_STATE_TYPE="$(jq ".[$i].state_type" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_IS_FLAPPING="$(jq ".[$i].is_flapping" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_ACKED="$(jq ".[$i].has_been_acknowledged" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_IN_DOWNTIME="$(jq ".[$i].in_scheduled_downtime" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+    HOST_NOTIF_ENABLED="$(jq ".[$i].notifications_enabled" <<<"$ICINGA_STATUS_HOSTS" | sed -e 's/"//g')"
+
+    # Be sure state is hard
+    if [ "$HOST_STATE_TYPE" != 'HARD' ]; then
+      continue
+    fi
+
+    # Be sure state is not flapping
+    if [ "$HOST_IS_FLAPPING" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure host is not acked
+    if [ "$HOST_ACKED" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure host is not in downtime
+    if [ "$HOST_IN_DOWNTIME" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure notifications are enabled
+    if [ "$HOST_NOTIF_ENABLED" = 'false' ]; then
+      continue
+    fi
+
+    # Set error message
+    ERR_MSG="${HOST_NAME}: ${HOST_STATUS}, ${ERR_MSG}"
+
+    # Set state
+    if [ "$HOST_STATUS" = 'DOWN' ]; then
+      ERR_CODE=$STATE_CRITICAL
+    elif [ "$HOST_STATUS" = 'UNREACHABLE' -a $ERR_CODE -ne $STATE_CRITICAL ]; then
+      ERR_CODE=$STATE_WARNING
+    fi
+  done
+fi
+
+# If service problems are set
+if [ "$ICINGA_STATUS_SERVICES" != '[]' ]; then
+  # Count array elements
+  PROBLEM_COUNT="$(($(grep 'host_name' <<< "$ICINGA_STATUS_SERVICES" | wc -l)-1))"
+
+  # Iterate over elements
+  for i in $(seq 0 $PROBLEM_COUNT); do
+    # Get service items
+    HOST_NAME="$(jq ".[$i].host_name" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_NAME="$(jq ".[$i].service_description" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_STATUS="$(jq ".[$i].status" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_STATE_TYPE="$(jq ".[$i].state_type" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_IS_FLAPPING="$(jq ".[$i].is_flapping" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_ACKED="$(jq ".[$i].has_been_acknowledged" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_IN_DOWNTIME="$(jq ".[$i].in_scheduled_downtime" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+    SERVICE_NOTIF_ENABLED="$(jq ".[$i].notifications_enabled" <<<"$ICINGA_STATUS_SERVICES" | sed -e 's/"//g')"
+
+    # Be sure state is hard
+    if [ "$SERVICE_STATE_TYPE" != 'HARD' ]; then
+      continue
+    fi
+
+    # Be sure state is not flapping
+    if [ "$SERVICE_IS_FLAPPING" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure service is not acked
+    if [ "$SERVICE_ACKED" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure service is not in downtime
+    if [ "$SERVICE_IN_DOWNTIME" = 'true' ]; then
+      continue
+    fi
+
+    # Be sure notifications are enabled
+    if [ "$SERVICE_NOTIF_ENABLED" = 'false' ]; then
+      continue
+    fi
+
+    # Set error message
+    ERR_MSG="${HOST_NAME}: ${SERVICE_NAME}, ${ERR_MSG}"
+
+    # Set state
+    if [ "$SERVICE_STATUS" = 'CRITICAL' ]; then
+      ERR_CODE=$STATE_CRITICAL
+    elif [ "$SERVICE_STATUS" = 'WARNING' -a $ERR_CODE -ne $STATE_CRITICAL ]; then
+      ERR_CODE=$STATE_WARNING
+    fi
+  done
+fi
+
+# State type messages
+case $ERR_CODE in
+  $STATE_OK)
+    echo "OK: All hosts/services normal"
+    ;;
+  $STATE_UNKNOWN)
+    echo "UNKNOWN: $ERR_MSG"
+    ;;
+  $STATE_WARNING)
+    echo "WARNING: $ERR_MSG" | sed 's/, $//'
+    ;;
+  $STATE_CRITICAL)
+    echo "CRITICAL: $ERR_MSG" | sed 's/, $//'
+    ;;
+esac
+
+# Remove temporary folder
+if [ -n "$TMP_DIR" -a -d "$TMP_DIR" ]; then
+  rm -rf "$TMP_DIR"
+fi
+
+# Exit with error code
+exit $ERR_CODE
